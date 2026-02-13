@@ -5,25 +5,23 @@ import hashlib
 import os
 
 app = Flask(__name__)
-app.secret_key = 'edirt_secret_key_2024'
+# Используем переменную окружения для секретного ключа
+app.secret_key = os.environ.get('SECRET_KEY', 'edirt_secret_key_2024')
 
 # Функции для работы с БД
 def get_db():
-    conn = sqlite3.connect('edirt.db')
+    # Используем /tmp для SQLite на Render (эта директория доступна для записи)
+    db_path = '/tmp/edirt.db'
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    print("Initializing database...")
     with get_db() as conn:
-        # Удаляем старую таблицу если она существует (для обновления структуры)
-        conn.execute('DROP TABLE IF EXISTS users')
-        conn.execute('DROP TABLE IF EXISTS posts')
-        conn.execute('DROP TABLE IF EXISTS comments')
-        conn.execute('DROP TABLE IF EXISTS likes')
-        
-        # Создаем таблицу пользователей с display_name
+        # Создаем таблицу пользователей
         conn.execute('''
-            CREATE TABLE users (
+            CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 display_name TEXT,
@@ -36,7 +34,7 @@ def init_db():
         
         # Таблица постов
         conn.execute('''
-            CREATE TABLE posts (
+            CREATE TABLE IF NOT EXISTS posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
@@ -48,7 +46,7 @@ def init_db():
         
         # Таблица комментариев
         conn.execute('''
-            CREATE TABLE comments (
+            CREATE TABLE IF NOT EXISTS comments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 post_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -61,7 +59,7 @@ def init_db():
         
         # Таблица лайков
         conn.execute('''
-            CREATE TABLE likes (
+            CREATE TABLE IF NOT EXISTS likes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 post_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -72,14 +70,28 @@ def init_db():
             )
         ''')
         
-        # Создаем админа
-        admin_password = hash_password('fima1456Game!')
-        conn.execute('''
-            INSERT INTO users (username, display_name, password, is_admin) 
-            VALUES (?, ?, ?, ?)
-        ''', ('admin', 'Официальный Аккаунт Edirt', admin_password, 1))
+        # Проверяем, есть ли админ
+        admin = conn.execute('SELECT * FROM users WHERE username = ?', ('admin',)).fetchone()
+        if not admin:
+            print("Creating admin user...")
+            admin_password = hash_password('fima1456Game!')
+            conn.execute('''
+                INSERT INTO users (username, display_name, password, is_admin) 
+                VALUES (?, ?, ?, ?)
+            ''', ('admin', 'Официальный Аккаунт Edirt', admin_password, 1))
+        
+        # Создаем тестовый пост для проверки
+        test_post = conn.execute('SELECT * FROM posts').fetchone()
+        if not test_post:
+            print("Creating test post...")
+            # Получаем ID админа
+            admin_id = conn.execute('SELECT id FROM users WHERE username = ?', ('admin',)).fetchone()['id']
+            conn.execute('''
+                INSERT INTO posts (user_id, content) VALUES (?, ?)
+            ''', (admin_id, 'Добро пожаловать в Edirt! 🎉 Это тестовый пост от официального аккаунта.'))
         
         conn.commit()
+        print("Database initialized successfully!")
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -1524,51 +1536,57 @@ ADMIN_USERS_TEMPLATE = '''
 # Маршруты Flask
 @app.route('/')
 def index():
-    with get_db() as conn:
-        # Получаем все посты от незабаненных пользователей
-        posts = conn.execute('''
-            SELECT posts.*, users.username, users.display_name, users.is_admin, users.is_banned 
-            FROM posts 
-            JOIN users ON posts.user_id = users.id 
-            WHERE users.is_banned = 0
-            ORDER BY posts.created_at DESC
-        ''').fetchall()
-        
-        posts_list = []
-        for post in posts:
-            comments = conn.execute('''
-                SELECT comments.*, users.username 
-                FROM comments 
-                JOIN users ON comments.user_id = users.id 
-                WHERE comments.post_id = ? 
-                ORDER BY comments.created_at ASC
-            ''', (post['id'],)).fetchall()
+    try:
+        with get_db() as conn:
+            # Получаем все посты от незабаненных пользователей
+            posts = conn.execute('''
+                SELECT posts.*, users.username, users.display_name, users.is_admin, users.is_banned 
+                FROM posts 
+                JOIN users ON posts.user_id = users.id 
+                WHERE users.is_banned = 0
+                ORDER BY posts.created_at DESC
+            ''').fetchall()
             
-            likes_count = conn.execute('''
-                SELECT COUNT(*) as count FROM likes WHERE post_id = ?
-            ''', (post['id'],)).fetchone()['count']
+            posts_list = []
+            for post in posts:
+                comments = conn.execute('''
+                    SELECT comments.*, users.username 
+                    FROM comments 
+                    JOIN users ON comments.user_id = users.id 
+                    WHERE comments.post_id = ? 
+                    ORDER BY comments.created_at ASC
+                ''', (post['id'],)).fetchall()
+                
+                likes_count = conn.execute('''
+                    SELECT COUNT(*) as count FROM likes WHERE post_id = ?
+                ''', (post['id'],)).fetchone()['count']
+                
+                user_liked = False
+                if session.get('user_id'):
+                    like = conn.execute('''
+                        SELECT id FROM likes WHERE post_id = ? AND user_id = ?
+                    ''', (post['id'], session['user_id'])).fetchone()
+                    user_liked = like is not None
+                
+                posts_list.append({
+                    'id': post['id'],
+                    'user_id': post['user_id'],
+                    'username': post['username'],
+                    'display_name': post['display_name'],
+                    'is_admin': post['is_admin'],
+                    'content': post['content'],
+                    'created_at': post['created_at'],
+                    'comments': comments,
+                    'likes': likes_count,
+                    'user_liked': user_liked
+                })
             
-            user_liked = False
-            if session.get('user_id'):
-                like = conn.execute('''
-                    SELECT id FROM likes WHERE post_id = ? AND user_id = ?
-                ''', (post['id'], session['user_id'])).fetchone()
-                user_liked = like is not None
-            
-            posts_list.append({
-                'id': post['id'],
-                'user_id': post['user_id'],
-                'username': post['username'],
-                'display_name': post['display_name'],
-                'is_admin': post['is_admin'],
-                'content': post['content'],
-                'created_at': post['created_at'],
-                'comments': comments,
-                'likes': likes_count,
-                'user_liked': user_liked
-            })
-    
-    return render_template_string(INDEX_TEMPLATE, posts=posts_list)
+            return render_template_string(INDEX_TEMPLATE, posts=posts_list)
+    except Exception as e:
+        print(f"Error in index route: {e}")
+        # Если произошла ошибка, пытаемся инициализировать БД заново
+        init_db()
+        return redirect(url_for('index'))
 
 @app.route('/admin/users')
 def admin_users():
@@ -1751,6 +1769,13 @@ def logout():
     flash('Вы вышли из системы', 'success')
     return redirect(url_for('index'))
 
+# Инициализация базы данных при запуске
+if __name__ != '__main__':
+    # В продакшене инициализируем БД при запуске
+    init_db()
+    print("Edirt app started in production mode")
+
 if __name__ == '__main__':
     init_db()
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
